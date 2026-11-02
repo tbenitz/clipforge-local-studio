@@ -1,0 +1,4 @@
+PySide6>=6.8,<7
+faster-whisper>=1.1,<2
+sounddevice>=0.5,<1
+numpy>=1.26,<3

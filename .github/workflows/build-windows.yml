@@ -1,0 +1,99 @@
+name: Build portable Windows EXE
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install application and build requirements
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+      - name: Run application unit tests
+        run: python -m pytest -q
+      - name: Build standalone Windows application folder
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --onedir --windowed --name ClipForgeStudio `
+            --collect-all faster_whisper --collect-all ctranslate2 --collect-all av `
+            --collect-all sounddevice --hidden-import=PySide6.QtMultimedia `
+            --hidden-import=PySide6.QtMultimediaWidgets `
+            main.py
+      - name: Include FFmpeg video and audio binaries (GPL)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/ClipForgeStudio/tools | Out-Null
+          $url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip'
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg-build.zip -MaximumRetryCount 3
+          Expand-Archive ffmpeg-build.zip -DestinationPath ffmpeg-unpack -Force
+          $ffmpeg = Get-ChildItem ffmpeg-unpack -Filter ffmpeg.exe -Recurse | Select-Object -First 1
+          $ffprobe = Get-ChildItem ffmpeg-unpack -Filter ffprobe.exe -Recurse | Select-Object -First 1
+          if (!$ffmpeg -or !$ffprobe) { throw 'FFmpeg binaries not in downloaded archive' }
+          Copy-Item $ffmpeg.FullName dist/ClipForgeStudio/tools/ffmpeg.exe
+          Copy-Item $ffprobe.FullName dist/ClipForgeStudio/tools/ffprobe.exe
+      - name: Include CPU llama.cpp inference server and DLLs
+        shell: pwsh
+        run: |
+          $headers = @{ 'User-Agent'='ClipForgeStudio-Build'; 'Accept'='application/vnd.github+json' }
+          $releases = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=25'
+          $asset = $releases | ForEach-Object { $_.assets } | Where-Object { $_.name -match '^llama-.*-bin-win-cpu-x64\.zip$' } | Select-Object -First 1
+          if (!$asset) { throw 'No Windows x64 CPU llama.cpp release asset was found. Build intentionally fails instead of publishing a broken package.' }
+          Write-Host "Using $($asset.name)"
+          Invoke-WebRequest -Headers $headers -Uri $asset.browser_download_url -OutFile llama-win.zip -MaximumRetryCount 3
+          Expand-Archive llama-win.zip -DestinationPath llama-unpack -Force
+          $server = Get-ChildItem llama-unpack -Filter llama-server.exe -Recurse | Select-Object -First 1
+          if (!$server) { throw 'llama-server.exe not in archive' }
+          Copy-Item (Join-Path $server.DirectoryName '*') dist/ClipForgeStudio/tools/ -Recurse -Force
+          if (!(Test-Path dist/ClipForgeStudio/tools/llama-server.exe)) { throw 'llama-server binary not copied' }
+      - name: Add README + writable portable model directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/ClipForgeStudio/data/models | Out-Null
+          Copy-Item README.md dist/ClipForgeStudio/README.md
+          Copy-Item THIRD_PARTY.md dist/ClipForgeStudio/THIRD_PARTY.md
+          Set-Content -Path dist/ClipForgeStudio/data/README.txt -Value 'Models, voice recordings and exports stay in this portable folder when writable. Run ClipForgeStudio.exe to begin.'
+      - name: Sanity-check embedded tools and exe
+        shell: pwsh
+        run: |
+          if (!(Test-Path dist/ClipForgeStudio/ClipForgeStudio.exe)) { throw 'App EXE missing' }
+          & dist/ClipForgeStudio/tools/ffmpeg.exe -version | Select-Object -First 1
+          & dist/ClipForgeStudio/tools/ffprobe.exe -version | Select-Object -First 1
+          & dist/ClipForgeStudio/tools/llama-server.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'llama-server startup check failed' }
+      - name: Smoke test actual packaged application startup
+        shell: pwsh
+        run: |
+          $app = (Resolve-Path dist/ClipForgeStudio/ClipForgeStudio.exe).Path
+          $process = Start-Process -FilePath $app -ArgumentList '--gui-self-test' -WorkingDirectory (Split-Path $app) -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            $log = 'dist/ClipForgeStudio/data/startup-error.log'
+            if (Test-Path $log) { Get-Content $log | Select-Object -Last 100 }
+            throw "Packaged application startup failed: $($process.ExitCode)"
+          }
+      - name: Package portable folder
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/ClipForgeStudio -DestinationPath ClipForgeStudio-Windows-Portable.zip -CompressionLevel Optimal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClipForgeStudio-Windows-Portable
+          path: ClipForgeStudio-Windows-Portable.zip
+          retention-days: 30
+          if-no-files-found: error
+      - name: Create GitHub Release for version tags
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ClipForgeStudio-Windows-Portable.zip
+          generate_release_notes: true
