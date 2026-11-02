@@ -1,0 +1,95 @@
+name: Import source and build portable EXE
+on:
+  push:
+    paths:
+      - '.repo_payload/ready.txt'
+permissions:
+  contents: write
+jobs:
+  import-and-build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Expand verified source bundle and publish full source
+        shell: pwsh
+        run: |
+          @'
+          import base64,io,lzma,tarfile,shutil
+          from pathlib import Path
+          parts=sorted(Path(".repo_payload").glob("part_*"))
+          assert len(parts)==8, f"Expected 8 source parts, found {len(parts)}"
+          payload=base64.b64decode("".join(x.read_text(encoding="ascii") for x in parts),validate=True)
+          archive=tarfile.open(fileobj=io.BytesIO(lzma.decompress(payload)),mode="r:")
+          members=archive.getmembers()
+          assert len(members)==18, f"Expected 18 source files, found {len(members)}"
+          for m in members:
+              target=Path(m.name)
+              assert not target.is_absolute() and ".." not in target.parts and m.isfile(),m.name
+              target.parent.mkdir(parents=True,exist_ok=True)
+              target.write_bytes(archive.extractfile(m).read())
+          shutil.rmtree(".repo_payload")
+          print("Expanded",len(members),"source files")
+          '@ | python -
+          git add -A
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -m "Import complete ClipForge Studio source"
+          git push origin HEAD:main
+      - name: Install and test
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+          python -m pytest -q
+      - name: Package application with PyInstaller
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --onedir --windowed --name ClipForgeStudio `
+            --collect-all faster_whisper --collect-all ctranslate2 --collect-all av `
+            --collect-all sounddevice --hidden-import=PySide6.QtMultimedia `
+            --hidden-import=PySide6.QtMultimediaWidgets main.py
+      - name: Install FFmpeg (GPL build)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/ClipForgeStudio/tools | Out-Null
+          Invoke-WebRequest -Uri 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip' -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-tmp -Force
+          foreach ($name in @('ffmpeg.exe','ffprobe.exe')) {
+            $f=Get-ChildItem ffmpeg-tmp -Recurse -Filter $name | Select-Object -First 1
+            if (!$f) { throw "Missing $name" }
+            Copy-Item $f.FullName dist/ClipForgeStudio/tools/
+          }
+      - name: Install llama.cpp CPU server
+        shell: pwsh
+        run: |
+          $headers=@{ 'User-Agent'='ClipForgeStudio-Builder'; 'Accept'='application/vnd.github+json' }
+          $releases=Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=25'
+          $asset=$releases | ForEach-Object { $_.assets } | Where-Object { $_.name -match '^llama-.*-bin-win-cpu-x64\.zip$' } | Select-Object -First 1
+          if (!$asset) { throw 'No CPU Windows llama.cpp release found' }
+          Invoke-WebRequest -Headers $headers -Uri $asset.browser_download_url -OutFile llama.zip
+          Expand-Archive llama.zip -DestinationPath llama-tmp -Force
+          $server=Get-ChildItem llama-tmp -Filter llama-server.exe -Recurse | Select-Object -First 1
+          if (!$server) { throw 'llama-server.exe missing' }
+          Copy-Item (Join-Path $server.DirectoryName '*') dist/ClipForgeStudio/tools/ -Recurse -Force
+      - name: Smoke-test portable executable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/ClipForgeStudio/data/models | Out-Null
+          Copy-Item README.md dist/ClipForgeStudio/README.md
+          Copy-Item THIRD_PARTY.md dist/ClipForgeStudio/THIRD_PARTY.md
+          & dist/ClipForgeStudio/tools/ffmpeg.exe -version | Select-Object -First 1
+          & dist/ClipForgeStudio/tools/llama-server.exe --version
+          $app=(Resolve-Path dist/ClipForgeStudio/ClipForgeStudio.exe).Path
+          $p=Start-Process -FilePath $app -ArgumentList '--gui-self-test' -WorkingDirectory (Split-Path $app) -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "App self-test failed: $($p.ExitCode)" }
+      - name: Upload portable Windows ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/ClipForgeStudio -DestinationPath ClipForgeStudio-Windows-Portable.zip -CompressionLevel Optimal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClipForgeStudio-Windows-Portable
+          path: ClipForgeStudio-Windows-Portable.zip
+          retention-days: 30
